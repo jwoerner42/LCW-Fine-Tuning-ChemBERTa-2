@@ -30,6 +30,7 @@ from transformers import Trainer, TrainingArguments, TrainerCallback, pipeline
 import pandas as pd
 import warnings
 import numpy as np
+from typing import List
 import evaluate
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from scipy.stats import spearmanr
@@ -94,9 +95,25 @@ class PrintValidationLossCallback(TrainerCallback):
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return metric.compute(predictions=predictions, references=labels)
 
+    # For regression with num_labels=1
+    predictions = logits.squeeze()
+
+    # Convert to numpy (sometimes needed depending on HF version)
+    predictions = np.array(predictions)
+    labels = np.array(labels)
+
+    rmse = mean_squared_error(labels, predictions) ** 0.5
+    mae = mean_absolute_error(labels, predictions)
+    r2 = r2_score(labels, predictions)
+    spearman_corr, _ = spearmanr(labels, predictions)
+
+    return {
+        "rmse": rmse,
+        "mae": mae,
+        "r2": r2,
+        "spearman": spearman_corr,
+    }
 
 # Read in solubility data and split
 def read_solubility(filename: str):
@@ -115,17 +132,15 @@ def read_solubility(filename: str):
 # retrieve the device to move the model to
 def get_device():
     if torch.cuda.is_available():
-        dev = torch.device("cuda")
         print("Using NV GPU.")
-    # The mps device in torch does repeatedly lead to a RuntimeError: Placeholder storage has not been allocated
-    # on MPS device!
-    #elif torch.backends.mps.is_available():
-    #    dev = torch.device("mps")
-    #    print("Using M1 GPU.")
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        print("Using M1 GPU.")
+        return torch.device("mps")
     else:
         print("No GPU available, using the CPU instead.")
-        dev = torch.device("cpu")
-    return dev
+        return torch.device("cpu")
+
 
 
 # Predict properties for new SMILES strings
@@ -136,27 +151,24 @@ def predict_smiles(u_smiles, dev):
         inputs = tokenizer(i_smiles, return_tensors="pt", padding='max_length', truncation=True, max_length=195).to(dev)
         with torch.no_grad():
             outputs = model(**inputs)
-    pred_property = outputs.logits.squeeze().item()
-    preds.append(pred_property)
-    r_mse = mean_squared_error(data["median_WS"], preds, squared=False)
-    r2 = r2_score(data["median_WS"], preds)
-    mae = mean_absolute_error(data["median_WS"], preds)
-    correlation, p_value = spearmanr(data["median_WS"], preds)
-    return r_mse, r2, mae, preds, correlation, p_value
+        pred_property = outputs.logits.squeeze().item()
+        preds.append(pred_property)
+
+    return preds
 
 
 # display the results
-def display_results(dataset_type, in_r_mse, in_r2, in_mae, preds, correlation, p_val):
+def display_results(dataset_type, in_r_mse, in_r2, in_mae, preds, correlation, p_val, y_true):
     print(dataset_type)
-    print("N:", len(data["median_WS"]))
+    print("N:", len(y_true))
     print("R2:", in_r2)
     print("Root Mean Square Error:", in_r_mse)
     print("Mean Absolute Error:", in_mae)
     print("Spearman correlation:", correlation)
     print("p-value:", p_val)
 
-    plt.scatter(data["median_WS"], preds)
-    plt.xlabel("train['median_WS']")
+    plt.scatter(y_true, preds)
+    plt.xlabel(dataset_type + "['median_WS']")
     plt.ylabel("predictions")
     plt.title("Scatter Plot of " + dataset_type + " ['median_WS'] vs Predictions")
     plt.show()
@@ -165,12 +177,30 @@ def display_results(dataset_type, in_r_mse, in_r2, in_mae, preds, correlation, p
 # assume test and predictions are two arrays of the same length
 # run it for prepared smiles data, set a string set_type for output, device, and a flag to save results
 def run_prediction(prep_smiles, set_type, dev, is_saved):
-    out_r_mse, out_r2, out_mae, predictions, correlation, p_value = predict_smiles(prep_smiles, dev)
-    display_results(set_type, out_r_mse, out_r2, out_mae, predictions, correlation, p_value)
-    if is_saved:
-        results_df = pd.DataFrame({"actual_WS": test["median_WS"], "predicted_WS": predictions})
-        results_df.to_csv("testset_results.csv", index=False)
+    predictions: List[float] = predict_smiles(prep_smiles, dev)
 
+    if set_type == "TRAINING SET":
+        y_true = data["median_WS"]
+    elif set_type == "VALIDATION SET":
+        y_true = valid["median_WS"]
+    elif set_type == "TEST SET":
+        y_true = test["median_WS"]
+    else:
+        raise ValueError(f"Unknown set_type: {set_type}")
+
+    # ensure plain python floats (helps spearmanr / sklearn)
+    y_true = y_true.to_numpy(dtype=float)
+
+    r_mse = mean_squared_error(y_true, predictions) ** 0.5
+    r2 = r2_score(y_true, predictions)
+    mae = mean_absolute_error(y_true, predictions)
+    correlation, p_value = spearmanr(y_true, predictions)
+
+    display_results(set_type, r_mse, r2, mae, predictions, correlation, p_value, y_true)
+
+    if is_saved:
+        results_df = pd.DataFrame({"actual_WS": y_true, "predicted_WS": predictions})
+        results_df.to_csv("testset_results.csv", index=False)
 
 #
 # main program
@@ -180,9 +210,14 @@ def run_prediction(prep_smiles, set_type, dev, is_saved):
 # Load a pretrained transformer model and tokenizer
 model_name = "DeepChem/ChemBERTa-77M-MTR"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+
 config = AutoConfig.from_pretrained(model_name)
 config.num_hidden_layers += 1
-model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=1,
+    problem_type="regression"
+)
 
 # see if GPU and assign model (move model to the device)
 device = get_device()
@@ -196,17 +231,21 @@ validation_dataset = Input(valid, tokenizer, max_length)
 # Set up training arguments
 training_args = TrainingArguments(
     output_dir=output_directory,
-    optim="adamw_torch",  # switch optimizer to avoid warning
-    num_train_epochs=100,  # Train the model for 100 epochs
-    per_device_train_batch_size=128,  # Set the batch size to 128
-    per_device_eval_batch_size=128,  # Set the evaluation batch size to 128
-    logging_steps=10,  # Log training metrics every 100 steps
-    eval_steps=10,  # Evaluate the model every 100 steps
-    save_steps=10,  # Save the model every 100 steps
-    seed=123,  # Set the random seed for reproducibility
-    evaluation_strategy="steps",  # Evaluate the model every eval_steps steps
-    load_best_model_at_end=True
+    optim="adamw_torch",
+    num_train_epochs=100,
+    per_device_train_batch_size=128,
+    per_device_eval_batch_size=128,
+    logging_steps=10,
+    eval_steps=10,
+    save_steps=10,
+    seed=123,
+    eval_strategy="steps",
+    load_best_model_at_end=True,
+    dataloader_pin_memory=torch.cuda.is_available(),
+    fp16=torch.cuda.is_available(),
+    bf16=torch.cuda.is_available(),
 )
+
 
 # Train the model
 trainer = Trainer(
@@ -214,12 +253,13 @@ trainer = Trainer(
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=validation_dataset,
+    compute_metrics=compute_metrics,
 )
 
 # Add the callback to the trainer
 trainer.add_callback(PrintValidationLossCallback())
 
-metric = evaluate.load("accuracy")
+#metric = evaluate.load("accuracy")
 
 # Train the model
 trainer.train()
@@ -227,9 +267,15 @@ trainer.train()
 # Save the model
 trainer.save_model("./output")
 
-# Create a prediction pipeline
-predictor = pipeline("text-classification", model=model, tokenizer=tokenizer)
-
+# Create a prediction pipeline configured for regression output:
+# function_to_apply="none" forces raw logits (your float prediction) to be returned as "score"
+predictor = pipeline(
+    "text-classification",
+    model=model,
+    tokenizer=tokenizer,
+    function_to_apply="none",   #
+    return_all_scores=False,
+)
 
 # Prepare new SMILES strings for prediction TRAINING-SET
 run_prediction(data['Standardized_SMILES'], "TRAINING SET", device, False)

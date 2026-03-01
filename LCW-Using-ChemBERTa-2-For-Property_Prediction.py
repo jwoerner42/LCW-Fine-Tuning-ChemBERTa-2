@@ -27,6 +27,8 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 import pandas as pd
+import numpy as np
+from typing import List
 from transformers import pipeline
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from scipy.stats import spearmanr
@@ -62,48 +64,41 @@ class Input(Dataset):
 # retrieve the device to move the model to
 def get_device():
     if torch.cuda.is_available():
-        dev = torch.device("cuda")
         print("Using NV GPU.")
-    # The mps device in torch does repeatedly lead to a RuntimeError: Placeholder storage has not been allocated
-    # on MPS device!
-    #elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-    #    dev = torch.device("mps")
-    #    print("Using M1 GPU.")
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        print("Using M1 GPU.")
+        return torch.device("mps")
     else:
         print("No GPU available, using the CPU instead.")
-        dev = torch.device("cpu")
-    return dev
+        return torch.device("cpu")
 
 
 # Predict properties for new SMILES strings
 def predict_smiles(u_smiles, dev):
     preds = []
+    model.eval()
     for i_smiles in u_smiles:
-        inputs = tokenizer(i_smiles, return_tensors="pt", padding='max_length', truncation=True, max_length=195).to(dev)
-        # max_length=195
+        inputs = tokenizer(i_smiles, return_tensors="pt", padding='max_length', truncation=True, max_length=max_length).to(dev)
         with torch.no_grad():
             outputs = model(**inputs)
-    pred_property = outputs.logits.squeeze().item()
-    preds.append(pred_property)
-    r_mse = mean_squared_error(data["median_WS"], preds, squared=False)
-    r2 = r2_score(data["median_WS"], preds)
-    mae = mean_absolute_error(data["median_WS"], preds)
-    correlation, p_value = spearmanr(data["median_WS"], preds)
-    return r_mse, r2, mae, preds, correlation, p_value
+        pred_property = outputs.logits.squeeze().item()
+        preds.append(float(pred_property))
+    return preds
 
 
 # display the results
-def display_results(dataset_type, in_r_mse, in_r2, in_mae, preds, correlation, p_val):
+def display_results(dataset_type, in_r_mse, in_r2, in_mae, preds, correlation, p_val, y_true):
     print(dataset_type)
-    print("N:", len(data["median_WS"]))
+    print("N:", len(y_true))
     print("R2:", in_r2)
     print("Root Mean Square Error:", in_r_mse)
     print("Mean Absolute Error:", in_mae)
     print("Spearman correlation:", correlation)
     print("p-value:", p_val)
 
-    plt.scatter(data["median_WS"], preds)
-    plt.xlabel("train['median_WS']")
+    plt.scatter(y_true, preds)
+    plt.xlabel(dataset_type + "['median_WS']")
     plt.ylabel("predictions")
     plt.title("Scatter Plot of " + dataset_type + " ['median_WS'] vs Predictions")
     plt.show()
@@ -112,11 +107,25 @@ def display_results(dataset_type, in_r_mse, in_r2, in_mae, preds, correlation, p
 # assume test and predictions are two arrays of the same length
 # run it for train smiles data
 def run_prediction(prep_smiles, set_type, dev, is_saved):
-    out_r_mse, out_r2, out_mae, predictions, correlation, p_value = predict_smiles(prep_smiles, dev)
+    predictions: List[float] = predict_smiles(prep_smiles, dev)
 
-    display_results(set_type, out_r_mse, out_r2, out_mae, predictions, correlation, p_value)
+    # Now choose correct labels based on set_type
+    if set_type == "TEST SET":
+        y_true = test["median_WS"]
+    else:
+        y_true = data["median_WS"]
+
+    # ensure plain python floats(helps spearmanr / sklearn)
+    y_true = y_true.to_numpy(dtype=float)
+
+    r_mse = mean_squared_error(y_true, predictions) ** 0.5
+    r2 = r2_score(y_true, predictions)
+    mae = mean_absolute_error(y_true, predictions)
+    correlation, p_value = spearmanr(y_true, predictions)  # type: ignore[arg-type]
+
+    display_results(set_type, r_mse, r2, mae, predictions, correlation, p_value, y_true)
     if is_saved:
-        results_df = pd.DataFrame({"actual_WS": test["median_WS"], "predicted_WS": predictions})
+        results_df = pd.DataFrame({"actual_WS": y_true, "predicted_WS": predictions})
         results_df.to_csv("testset_results.csv", index=False)
 
 #
@@ -139,7 +148,7 @@ config.num_hidden_layers += 1
 model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
 
 # move model to the device
-device = get_device()
+device= get_device()
 model.to(device)
 
 # Prepare the dataset for training
@@ -153,6 +162,8 @@ training_args = TrainingArguments(
     logging_steps=100,  # Log training metrics every 100 steps
     optim="adamw_torch",  # switch optimizer to avoid warning
     seed=123,  # Set a random seed for reproducibility
+    dataloader_pin_memory=torch.cuda.is_available(),
+    fp16=torch.cuda.is_available(),
 )
 
 # Train the model
@@ -170,7 +181,7 @@ run_prediction(test_smiles, "TEST SET", device, False)
 
 # Prepare new SMILES strings for prediction and run the model for training data
 train_smiles = data['Standardized_SMILES']
-run_prediction(train_smiles, "TEST SET", device, False)
+run_prediction(train_smiles, "TRAIN SET", device, False)
 
 
 
