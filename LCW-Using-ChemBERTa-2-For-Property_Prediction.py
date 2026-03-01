@@ -164,13 +164,14 @@ training_args = TrainingArguments(
     seed=123,  # Set a random seed for reproducibility
     dataloader_pin_memory=torch.cuda.is_available(),
     fp16=torch.cuda.is_available(),
+    bf16=torch.cuda.is_available(),
 )
 
 # Train the model
 trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, )
 trainer.train()
-trainer.save_model("./output")  # save model to output folder
-
+trainer.save_model(output_directory)  # save model to output folder
+tokenizer.save_pretrained(output_directory)
 # Create a prediction pipeline
 
 predictor = pipeline("text-classification", model=model, tokenizer=tokenizer)
